@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OCR 一键识别 (Alt+Q)
 // @namespace    https://github.com/lemon-meng-meng/Broom-dustpan
-// @version      1.6
+// @version      1.6.2
 // @description  浏览器内截图后按 Alt+Q 一键 OCR（使用者需自备 OCR.space 免费 API Key）
 // @author       lemon-meng-meng
 // @match        *://*/*
@@ -21,19 +21,23 @@
 
     // 配置管理 - 不包含任何真实 API Key
     const CONFIG = {
-        OCR_API_KEY: null, // 完全由用户通过菜单设置
+        OCR_API_KEY: null,
         DEFAULT_API_URL: 'https://api.ocr.space/parse/image',
         MAX_FILE_SIZE: 1024 * 1024, // 1MB
-        SUPPORTED_IMAGE_TYPES: ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/bmp', 'image/gif']
+        IMAGE_TYPE_MAPPING: {
+            'image/png': '.png',
+            'image/jpeg': '.jpg',
+            'image/jpg': '.jpg',
+            'image/webp': '.webp',
+            'image/bmp': '.bmp',
+            'image/gif': '.gif'
+        }
     };
 
-    // 初始化配置
     function initConfig() {
-        // 默认值为空字符串，不包含任何示例Key
         CONFIG.OCR_API_KEY = GM_getValue('OCR_API_KEY', '');
     }
 
-    // API Key 设置菜单
     function registerApiKeyMenu() {
         if (typeof GM_registerMenuCommand === 'function') {
             GM_registerMenuCommand('设置 OCR API Key', () => {
@@ -59,7 +63,6 @@
                             timeout: 3000
                         });
                     } else if (currentKey) {
-                        // 清空Key
                         const confirmClear = confirm('确定要清空 API Key 吗？\n清空后将无法使用OCR功能。');
                         if (confirmClear) {
                             GM_setValue('OCR_API_KEY', '');
@@ -76,7 +79,6 @@
         }
     }
 
-    // 检查 API Key
     function validateApiKey() {
         if (!CONFIG.OCR_API_KEY || CONFIG.OCR_API_KEY.trim() === '') {
             throw new Error('请先设置 OCR API Key\n\n点击Tampermonkey图标 → OCR 一键识别 → 设置 OCR API Key');
@@ -86,11 +88,14 @@
         }
     }
 
-    async function ocrSpace(blob) {
+    async function ocrSpace(blob, fileType) {
         validateApiKey();
 
         const form = new FormData();
-        form.append('file', blob, `clipboard_${Date.now()}.png`);
+        const extension = CONFIG.IMAGE_TYPE_MAPPING[fileType] || '.png';
+        const fileName = `clipboard_${Date.now()}${extension}`;
+        
+        form.append('file', blob, fileName);
         form.append('language', 'chs');
         form.append('isOverlayRequired', 'false');
         form.append('detectOrientation', 'true');
@@ -111,17 +116,28 @@
             clearTimeout(timeoutId);
 
             if (!res.ok) {
-                throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+                let errorText = `HTTP ${res.status}: ${res.statusText}`;
+                try {
+                    const errorData = await res.json();
+                    errorText = errorData.ErrorMessage || errorText;
+                } catch (e) {}
+                throw new Error(errorText);
             }
 
             const data = await res.json();
             
             if (data.IsErroredOnProcessing) {
                 const errorMsg = data.ErrorMessage || data.ErrorDetails || 'OCR 处理失败';
-                if (errorMsg.includes('Invalid API key') || errorMsg.includes('unauthorized')) {
+                
+                if (errorMsg.includes('Unable to recognize the file type') || 
+                    errorMsg.includes('Unable to detect the file extension')) {
+                    throw new Error('文件类型识别失败，请尝试重新截图或使用PNG格式');
+                } else if (errorMsg.includes('Invalid API key') || errorMsg.includes('unauthorized')) {
                     throw new Error('API Key 无效或已过期\n请重新获取：https://ocr.space/ocrapi/freekey');
                 } else if (errorMsg.includes('file size')) {
-                    throw new Error('图片文件过大\n请使用较小的截图');
+                    throw new Error('图片文件过大\n请使用较小的截图（建议小于500KB）');
+                } else if (errorMsg.includes('rate limit')) {
+                    throw new Error('API 调用频率超限\n免费版每小时最多调用30次，请稍后重试');
                 }
                 throw new Error(errorMsg);
             }
@@ -135,7 +151,7 @@
         } catch (error) {
             clearTimeout(timeoutId);
             if (error.name === 'AbortError') {
-                throw new Error('OCR 识别超时，请稍后重试');
+                throw new Error('OCR 识别超时（30秒），请稍后重试');
             }
             throw error;
         }
@@ -144,17 +160,21 @@
     async function getImageFromClipboard() {
         try {
             if (typeof navigator.clipboard.read !== 'function') {
-                throw new Error('浏览器不支持剪贴板读取API');
+                throw new Error('浏览器不支持剪贴板读取API\n请使用最新版Chrome/Edge/Firefox');
             }
 
             const items = await navigator.clipboard.read();
             
             for (const item of items) {
-                for (const type of CONFIG.SUPPORTED_IMAGE_TYPES) {
+                for (const type in CONFIG.IMAGE_TYPE_MAPPING) {
                     if (item.types.includes(type)) {
-                        const blob = await item.getType(type);
-                        if (blob.size > 0) {
-                            return { blob, type };
+                        try {
+                            const blob = await item.getType(type);
+                            if (blob && blob.size > 0) {
+                                return { blob, type };
+                            }
+                        } catch (e) {
+                            console.warn(`获取 ${type} 失败:`, e);
                         }
                     }
                 }
@@ -163,9 +183,13 @@
             for (const item of items) {
                 for (const type of item.types) {
                     if (type.startsWith('image/')) {
-                        const blob = await item.getType(type);
-                        if (blob.size > 0) {
-                            return { blob, type };
+                        try {
+                            const blob = await item.getType(type);
+                            if (blob && blob.size > 0) {
+                                return { blob, type };
+                            }
+                        } catch (e) {
+                            console.warn(`获取 ${type} 失败:`, e);
                         }
                     }
                 }
@@ -173,7 +197,7 @@
             
             return null;
         } catch (error) {
-            console.warn('剪贴板读取失败:', error);
+            console.error('剪贴板读取失败:', error);
             
             if (error.name === 'NotAllowedError') {
                 throw new Error('需要剪贴板读取权限\n请点击地址栏左侧的权限图标，允许剪贴板访问');
@@ -189,7 +213,7 @@
         try {
             GM_notification({
                 title: 'OCR 处理中',
-                text: '正在读取剪贴板...',
+                text: '正在检查剪贴板...',
                 timeout: 3000,
                 silent: true
             });
@@ -197,7 +221,7 @@
             const imgData = await getImageFromClipboard();
             
             if (!imgData) {
-                throw new Error('剪贴板中没有检测到图片\n请先截图（Win+Shift+S / Cmd+Shift+4）');
+                throw new Error('剪贴板中没有检测到图片\n请先截图（Win+Shift+S / Cmd+Shift+4）\n然后按 Alt+Q');
             }
 
             const { blob, type } = imgData;
@@ -206,20 +230,24 @@
                 throw new Error(`图片过大 (${Math.round(blob.size / 1024)}KB)\n最大支持 ${CONFIG.MAX_FILE_SIZE / 1024}KB`);
             }
 
+            if (blob.size === 0) {
+                throw new Error('图片为空\n请重新截图');
+            }
+
             const ok = confirm(`检测到 ${type} 格式图片 (${Math.round(blob.size / 1024)}KB)\n是否进行 OCR 文字识别？\n\n注意：图片将发送至 OCR.space 服务器处理`);
             if (!ok) return;
 
             GM_notification({
                 title: 'OCR 处理中',
-                text: '正在识别文字...',
-                timeout: 3000,
+                text: '正在上传并识别文字...',
+                timeout: 5000,
                 silent: true
             });
 
-            const text = await ocrSpace(blob);
+            const text = await ocrSpace(blob, type);
             
-            if (!text) {
-                throw new Error('未识别到文字\n请确保图片清晰且包含文字');
+            if (!text || text.trim() === '') {
+                throw new Error('未识别到文字\n可能原因：\n1. 图片不清晰\n2. 文字区域太小\n3. 图片中没有文字');
             }
 
             await copyToClipboard(text);
@@ -284,19 +312,28 @@
     }
 
     function showResultDialog(text) {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 9999;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        `;
+        
         const dialog = document.createElement('div');
         dialog.style.cssText = `
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
             background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 5px 30px rgba(0,0,0,0.3);
-            z-index: 10000;
-            max-width: 80%;
-            max-height: 80%;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 8px 40px rgba(0,0,0,0.2);
+            max-width: 500px;
+            max-height: 80vh;
             overflow: auto;
             font-family: system-ui, -apple-system, sans-serif;
         `;
@@ -308,48 +345,42 @@
         const textarea = document.createElement('textarea');
         textarea.value = text;
         textarea.style.cssText = `
-            width: 400px;
+            width: 100%;
             height: 200px;
             margin: 10px 0;
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 5px;
-            font-family: monospace;
-            resize: both;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-family: 'Segoe UI', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            resize: vertical;
+            box-sizing: border-box;
         `;
         
         const buttonContainer = document.createElement('div');
-        buttonContainer.style.textAlign = 'right';
+        buttonContainer.style.cssText = 'text-align:center;margin-top:15px;';
         
         const copyBtn = document.createElement('button');
         copyBtn.textContent = '复制';
+        copyBtn.style.cssText = 'margin-right:10px;padding:5px 15px;cursor:pointer;';
         copyBtn.onclick = () => {
             copyToClipboard(text);
             copyBtn.textContent = '已复制!';
-            setTimeout(() => copyBtn.textContent = '复制', 2000);
+            copyBtn.style.background = '#4CAF50';
+            copyBtn.style.color = 'white';
+            setTimeout(() => {
+                copyBtn.textContent = '复制';
+                copyBtn.style.background = '';
+                copyBtn.style.color = '';
+            }, 2000);
         };
         
         const closeBtn = document.createElement('button');
         closeBtn.textContent = '关闭';
-        closeBtn.style.marginLeft = '10px';
+        closeBtn.style.cssText = 'padding:5px 15px;cursor:pointer;';
         closeBtn.onclick = () => {
             document.body.removeChild(overlay);
-            document.body.removeChild(dialog);
-        };
-        
-        const overlay = document.createElement('div');
-        overlay.style.cssText = `
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0,0,0,0.5);
-            z-index: 9999;
-        `;
-        overlay.onclick = () => {
-            document.body.removeChild(overlay);
-            document.body.removeChild(dialog);
         };
         
         buttonContainer.appendChild(copyBtn);
@@ -358,9 +389,14 @@
         dialog.appendChild(title);
         dialog.appendChild(textarea);
         dialog.appendChild(buttonContainer);
-        
+        overlay.appendChild(dialog);
         document.body.appendChild(overlay);
-        document.body.appendChild(dialog);
+        
+        overlay.onclick = (e) => {
+            if (e.target === overlay) {
+                document.body.removeChild(overlay);
+            }
+        };
         
         textarea.focus();
         textarea.select();
@@ -382,7 +418,7 @@
             registerApiKeyMenu();
             
             GM_registerMenuCommand('使用帮助', () => {
-                alert(`OCR 一键识别 v1.6\n\n使用方法:\n1. 截图到剪贴板 (Win+Shift+S / Cmd+Shift+4)\n2. 按 Alt+Q 或点击菜单\n3. 自动识别并复制文字\n\n首次使用需设置 API Key:\n1. 访问 https://ocr.space/ocrapi/freekey\n2. 输入邮箱获取免费 Key\n3. 点击Tampermonkey图标 → 设置 OCR API Key`);
+                alert(`OCR 一键识别 v1.6.2\n\n使用方法:\n1. 截图到剪贴板 (Win+Shift+S / Cmd+Shift+4)\n2. 按 Alt+Q 或点击菜单\n3. 自动识别并复制文字\n\n首次使用需设置 API Key:\n1. 访问 https://ocr.space/ocrapi/freekey\n2. 输入邮箱获取免费 Key\n3. 点击Tampermonkey图标 → 设置 OCR API Key\n\n注意：\n• 支持多种图片格式\n• 图片需小于1MB\n• 免费版每小时最多30次识别`);
             }, 'H');
         }
     }
